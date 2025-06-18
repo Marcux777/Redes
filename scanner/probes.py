@@ -1,9 +1,22 @@
 from icmplib import async_ping
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 from pysnmp.hlapi.asyncio import get_cmd, SnmpEngine, CommunityData, UdpTransportTarget, ContextData, ObjectType, ObjectIdentity
 
 
 ProbeResult = Tuple[str, Optional[str]]
+
+SNMP_OIDS: Dict[str, str] = {
+    'Descrição do Sistema': '1.3.6.1.2.1.1.1.0',
+    'Object ID': '1.3.6.1.2.1.1.2.0',
+    'Tempo de Atividade': '1.3.6.1.2.1.1.3.0',
+    'Nome SNMP': '1.3.6.1.2.1.1.5.0',
+    'Contato': '1.3.6.1.2.1.1.4.0',
+    'Serviços': '1.3.6.1.2.1.1.7.0',
+    'Número de Interfaces': '1.3.6.1.2.1.2.1.0',
+    'CPU Idle (%)': '1.3.6.1.4.1.2021.11.11.0',
+    'Memória Total (kB)': '1.3.6.1.4.1.2021.4.5.0',
+    'Memória Livre (kB)': '1.3.6.1.4.1.2021.4.6.0',
+}
 
 
 async def probe_icmp(ip: str) -> Optional[ProbeResult]:
@@ -72,6 +85,44 @@ async def probe_snmp(ip: str, community: str = 'public') -> Optional[ProbeResult
         return None
     finally:
         # Encerra o dispatcher SNMP, se disponível, evitando leaks de file descriptors.
+        try:
+            dispatcher = snmp_engine.transportDispatcher
+            if dispatcher:
+                dispatcher.closeDispatcher()
+        except Exception:
+            pass
+
+
+async def probe_snmp_info(ip: str, community: str = 'public') -> Optional[Dict[str, str]]:
+    """
+    Executa uma sondagem SNMP e devolve um dicionário com diversos atributos
+    do host (descritos em SNMP_OIDS).
+
+    Retorna None se nenhuma informação for obtida.
+    """
+    snmp_engine = SnmpEngine()
+    info: Dict[str, str] = {}
+
+    try:
+        for desc, oid in SNMP_OIDS.items():
+            error_indication, error_status, error_index, var_binds = await get_cmd(
+                snmp_engine,
+                CommunityData(community, mpModel=0),
+                UdpTransportTarget((ip, 161), timeout=1, retries=1),
+                ContextData(),
+                ObjectType(ObjectIdentity(oid))
+            )
+
+            if error_indication or error_status:
+                continue  # Tenta próximo OID
+            else:
+                value = str(var_binds[0][1])
+                info[desc] = value
+
+        return info if info else None
+    except Exception:
+        return None
+    finally:
         try:
             dispatcher = snmp_engine.transportDispatcher
             if dispatcher:

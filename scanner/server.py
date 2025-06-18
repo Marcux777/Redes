@@ -1,40 +1,75 @@
 import asyncio
+import socket
+from getmac import get_mac_address
+from .mac_vendor_lookup import MACVendorLookup
 from .utils import parse_cidr  # Importa a função do nosso novo módulo
-from .probes import probe_snmp, probe_icmp  # Importar as sondas
-from typing import Optional, Tuple
+from .probes import probe_snmp_info, probe_icmp  # funções necessárias
+from typing import Optional, Dict, List
 import concurrent.futures
 
-# (IP, Tipo de resultado, Valor) ex: ("1.1.1.1", "snmp", "dns.google")
-ScanResult = Tuple[str, str, str]
+# Tipo de resultado detalhado, alinhado ao formato da versão "Scanner com SNMP"
+HostInfo = Dict[str, Optional[str]]
 
 
-def scan_host(ip: str, community: str) -> Optional[ScanResult]:
-    """
-    Função de trabalho que escaneia um único host.
-    Projetada para ser executada em um ThreadPoolExecutor.
-    Tenta SNMP primeiro, depois faz fallback para ICMP.
-    """
+def reverse_dns(ip: str) -> Optional[str]:
+    """Tenta resolver o nome DNS do host (PTR record)."""
     try:
-        # Pysnmp, mesmo com API asyncio, pode ser chamado de forma síncrona
-        # dentro de um loop de eventos gerenciado por asyncio.run()
-        snmp_result = asyncio.run(probe_snmp(ip, community))
-        if snmp_result:
-            _, value = snmp_result
-            return (ip, "snmp", value)
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:
+        return None
 
-        # Fallback para ICMP se SNMP falhar
-        icmp_result = asyncio.run(probe_icmp(ip))
-        if icmp_result:
-            _, value = icmp_result
-            return (ip, "icmp", value)
+
+def format_host_info(info: HostInfo) -> str:
+    """Formata o dicionário HostInfo para string de resposta ao cliente."""
+    lines: List[str] = []
+    lines.append(f"Nome DNS: {info.get('name') or info['ip']}")
+    lines.append(f"Endereço IP: {info['ip']}")
+    lines.append(f"MAC Address: {info.get('mac', '') or ''}")
+    lines.append(f"Fabricante: {info.get('vendor', '') or ''}")
+    snmp_info: Optional[Dict[str, str]] = info.get('snmp_info')  # type: ignore
+    if snmp_info:
+        for desc, value in snmp_info.items():
+            lines.append(f"{desc}: {value}")
+    return '\n'.join(lines) + '\n\n'
+
+
+def scan_host(ip: str, community: str) -> Optional[HostInfo]:
+    """Escaneia um host individual e devolve informações detalhadas ou None."""
+    host_info: HostInfo = {
+        'ip': ip,
+        'name': None,
+        'mac': None,
+        'vendor': None,
+        'snmp_info': None,
+    }
+
+    try:
+        # Primeiro tenta SNMP completo
+        snmp_full = asyncio.run(probe_snmp_info(ip, community))
+        if snmp_full:
+            host_info['snmp_info'] = snmp_full
+
+        # Checa se host está vivo: SNMP ok ou ICMP responde
+        alive = bool(snmp_full)
+        if not alive:
+            icmp_result = asyncio.run(probe_icmp(ip))
+            alive = bool(icmp_result)
+        if not alive:
+            return None  # host aparentemente inativo
+
+        # Enriquecimento de dados
+        host_info['name'] = reverse_dns(ip)
+        mac = get_mac_address(ip=ip)
+        host_info['mac'] = mac
+        host_info['vendor'] = MACVendorLookup.get_vendor(mac) if mac else "Unknown"
+        return host_info
 
     except PermissionError:
-        # Se o ping falhar por permissão, não podemos continuar
-        print(
-            f"AVISO: O escaneamento de {ip} falhou devido a um erro de permissão para ICMP.")
-        return (ip, "error", "Permission Denied")
-
-    return None
+        print(f"AVISO: Permissões insuficientes para ICMP em {ip}.")
+        return None
+    except Exception as e:
+        print(f"Erro ao escanear {ip}: {e}")
+        return None
 
 
 HOST = '0.0.0.0'
@@ -91,12 +126,8 @@ async def handle_client(reader, writer):
 
             if active_hosts:
                 response_lines = []
-                for ip, proto, value in active_hosts:
-                    if proto == 'snmp':
-                        response_lines.append(f"{ip} {value}")
-                    elif proto == 'icmp':
-                        response_lines.append(ip)
-                    # Ignoramos resultados de 'error' na saída final para o cliente
+                for info in active_hosts:
+                    response_lines.append(format_host_info(info))
 
                 response = "\n".join(response_lines) + "\n"
             else:
